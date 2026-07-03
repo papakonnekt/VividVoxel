@@ -1,0 +1,6 @@
+- [x] (previous) CMY + base + lithotop + CMY color layers — done
+- [x] Add explicit `verify_xy_alignment()` helper
+- [x] Document the alignment guarantee in module docstring + as `LithophaneResult.verify_alignment()` method
+- [x] Switch STL filenames to the numbered convention (1_Base_White ... 5_Top_White)
+- [x] Update README to document the slicer-friendly file naming + alignment guarantee
+- [x] Verify the new file names + alignment end-to-end (live + on-disk round-trip)
