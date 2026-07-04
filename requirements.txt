@@ -1,3 +1,10 @@
+# Core pipeline
 Pillow>=9.0
 numpy>=1.23
 numpy-stl>=3.0
+
+# Mesh decimation (Task 2) -- required by simplify_meshes() / --simplify-faces
+trimesh>=4.0
+
+# Web interface (Task 1) -- required only for `streamlit run app.py`
+streamlit>=1.28

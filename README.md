@@ -10,9 +10,11 @@ VividVoxel produces:
 * the three **Cyan / Magenta / Yellow thickness channels** (NumPy / PNG)
 * a flat **base-plate STL** (default 0.6 mm thick, `numpy-stl`)
 * three **CMY color-layer STLs** -- one per ink -- each with a flat bottom
-  and a heightmap top, capped at **0.5 mm** of thickness per layer
+  and a heightmap top, capped at **`max_cmy_thickness_mm`** per layer
 * a **lithotop STL** whose per-pixel height is driven by the luminance of
   the original image, providing shadows and highlights
+* a **solid border frame** around the perimeter of every layer to
+  prevent light bleed
 
 ```
                     ┌─────────────────────────────┐
@@ -31,6 +33,7 @@ VividVoxel produces:
                     ├─────────────────────────────┤
                     │  Base plate (flat)          │  base_thickness (mm)
                     └─────────────────────────────┘
+   ↑ every layer has a solid border (default 2 mm) padded around it
 ```
 
 The five STL files are written with **numbered, slicer-friendly names**
@@ -39,6 +42,7 @@ order and stack them on top of each other:
 
 | #  | File                  | Layer                                          |
 | -- | --------------------- | ---------------------------------------------- |
+| 0  | `0_Frame.stl`         | Structural frame ring (optional)               |
 | 1  | `1_Base_White.stl`    | Structural base plate                          |
 | 2  | `2_Cyan.stl`          | Cyan color layer (flat bottom, heightmap top)   |
 | 3  | `3_Magenta.stl`       | Magenta color layer                            |
@@ -53,11 +57,60 @@ order and stack them on top of each other:
 pip install -r requirements.txt
 ```
 
-Dependencies: **Pillow ≥ 9**, **NumPy ≥ 1.23**, **numpy-stl ≥ 3**.
+Dependencies:
+
+| Package         | Why                                                         |
+| --------------- | ----------------------------------------------------------- |
+| `Pillow >= 9`   | Load / resize the source image                              |
+| `numpy >= 1.23` | All pixel-array math                                        |
+| `numpy-stl >= 3`| Write the five `.stl` files                                 |
+| `trimesh >= 4`  | Optional mesh decimation (`simplify_meshes`, `--simplify-faces`) |
+| `streamlit >= 1.28` | Optional web UI (`streamlit run app.py`)                |
+
+`trimesh` and `streamlit` are only required if you use the
+corresponding feature; the core CLI and library work without them.
 
 ---
 
 ## Quick start
+
+### Web UI (recommended for one-off prints)
+
+```bash
+pip install -r requirements.txt        # picks up streamlit + trimesh
+streamlit run app.py
+```
+
+The UI provides:
+
+* an **image upload** widget (jpg / png / bmp / tiff / webp), or a
+  built-in synthetic demo image;
+* paired **numeric input + slider** widgets for **Width / Height (mm)**,
+  **Min / Max Thickness (mm)** (lithotop luminance range), the
+  structural **Frame Width / Frame Depth (mm)** (or disable the frame
+  entirely), **Border Width (mm)**, and **Mesh Resolution (px/mm)**;
+  everything uses a 0.1 mm step where it matters;
+* a **live 2.5D depth-map preview** rendered instantly with Pillow as
+  soon as an image is uploaded or any slider moves — no need to wait
+  for the full STL pipeline to see what the print will look like;
+* an optional **Simplify to N triangles (QEM)** decimation target for
+  smaller files at the cost of a few boundary pixels;
+* a **Generate lithophane** button that produces a single ZIP file
+  containing the aligned STLs (`0_Frame.stl` … `5_Top_White.stl`) plus
+  per-channel preview PNGs and a `README.txt`.
+
+The hard-coded constants tuned for standard CMYK filament profiles
+are intentionally **not exposed** in the UI:
+
+| Constant                       | Value | Meaning                                       |
+| ------------------------------ | ----- | --------------------------------------------- |
+| `DEFAULT_BASE_THICKNESS_MM`    | 0.6   | Floor plate thickness                          |
+| `DEFAULT_MAX_CMY_THICKNESS_MM` | 0.4   | Maximum per-channel CMY layer thickness        |
+
+Power users can still override these from the CLI via
+`--base-thickness-mm` and `--max-cmy-thickness-mm`.
+
+### CLI
 
 ```bash
 # Default: 100 × 100 mm at 10 px/mm, base 0.6 mm, CMY ≤ 0.5 mm each,
@@ -76,6 +129,9 @@ python lithophane_cmy.py photo.jpg --width 80 --height 60 \
 
 # CMY channels only, no STL output
 python lithophane_cmy.py photo.jpg --no-stl
+
+# Decimate the four heightmap meshes to ~5 000 triangles each
+python lithophane_cmy.py photo.jpg --simplify-faces 5000
 ```
 
 The CLI automatically verifies X/Y alignment and prints each mesh's
@@ -109,7 +165,7 @@ Outputs in `--out-dir` (default `output/`):
 | `<name>_luminance.npy`            | BT.601 luminance, `float32`, shape `(H, W)`          |
 | `<name>_lithotop_z.npy`           | Top-Z height per pixel (mm), `float32`, shape `(H, W)` |
 | `1_Base_White.stl`                | Flat rectangular base plate (12 triangles)           |
-| `2_Cyan.stl`                      | Cyan color layer (flat bottom, heightmap top, ≤ 0.5 mm) |
+| `2_Cyan.stl`                      | Cyan color layer (flat bottom, heightmap top)         |
 | `3_Magenta.stl`                   | Magenta color layer                                  |
 | `4_Yellow.stl`                    | Yellow color layer                                   |
 | `5_Top_White.stl`                 | Top white layer (per-pixel columns, by luminance)    |
@@ -130,20 +186,141 @@ loaded into a slicer, they line up perfectly on top of each other:
   `height_mm` and pixel grid;
 * the X coordinates lie in `[0, width_mm]`, the Y coordinates lie in
   `[0, height_mm]`, and every mesh's bounding box is identical to within
-  floating-point precision.
+  floating-point precision;
+* a configurable **border frame** (default 2 mm) is padded around the
+  perimeter of all five meshes -- giving them identical X/Y extent.
 
 Programmatically you can assert the same property with either:
 
 ```python
 result.verify_alignment()              # returns bounds dict, raises on mismatch
 # or, with arbitrary meshes:
-vividvoxel.verify_xy_alignment({"a": mesh_a, "b": mesh_b, ...})
+lithophane_cmy.verify_xy_alignment({"a": mesh_a, "b": mesh_b, ...})
 ```
 
-(The current module is published under its original name `lithophane_cmy`
-for backward compatibility -- the public functions are
-`lithophane_cmy.verify_xy_alignment` and
-`lithophane_cmy.LithophaneResult.verify_alignment`.)
+---
+
+## Mesh decimation (Task 2)
+
+A naive CMY lithophane emits **12 triangles per pixel column**.  For a
+200×200 pixel image that's 480 000 triangles per layer -- a multi-MB STL
+that slices slowly and prints slowly too.  VividVoxel therefore ships
+with an optional `simplify_meshes()` helper that uses **trimesh** to:
+
+1. **merge coplanar / coincident vertices** (`merge_vertices()`) -- this
+   is the big win and *drastically* reduces the triangle count without
+   any geometric change.  Empirically this collapses 90%+ of the
+   duplicate column corners in a typical lithophane heightmap.
+2. optionally apply **quadric-error-mesh (QEM) decimation** down to a
+   user-specified triangle budget (`simplify_quadric_decimation`).
+
+Use it from Python:
+
+```python
+from lithophane_cmy import process_image, simplify_meshes
+
+result = process_image("photo.jpg", width_mm=100, height_mm=100)
+meshes = {
+    "base":     result.base_stl,
+    "cyan":     result.cyan_layer_stl,
+    "magenta":  result.magenta_layer_stl,
+    "yellow":   result.yellow_layer_stl,
+    "lithotop": result.lithotop_stl,
+}
+simplified = simplify_meshes(meshes, target_face_count=5000)
+# Each simplified["..."] is now a numpy-stl Mesh with <<< triangles.
+```
+
+Or from the CLI:
+
+```bash
+python lithophane_cmy.py photo.jpg --simplify-faces 5000
+```
+
+The Streamlit UI exposes the same slider ("Simplify to N triangles
+(QEM)") -- set it to `0` to disable.
+
+> Note: QEM is a *visual* simplification.  It can shift boundary
+> vertices by a few pixels.  If you need bit-exact X/Y alignment across
+> the five STLs, leave decimation **off** and rely on the
+> `merge_vertices` pass only (which is purely geometric and therefore
+> alignment-safe).
+
+---
+
+## Border frame (Task 3)
+
+To prevent stray light from leaking between layers around the edges of
+the print, VividVoxel pads each mesh with a **solid rectangular frame**
+of width `border_width_mm` (default **2 mm**, set to `0` to disable).
+The frame:
+
+* surrounds **all five layers identically**, so the alignment guarantee
+  still holds;
+* uses `channel = 1.0` (maximum thickness) for the padded pixels, so
+  each layer's outer ring is a solid slab of plastic.
+
+Configure it from the CLI (`--border-width-mm 3`), programmatically
+(`process_image(..., border_width_mm=3.0)`) or via the Streamlit UI.
+
+---
+
+## Structural frame (optional)
+
+For prints that need extra rigidity or a clean outer edge, VividVoxel can
+emit a separate **hollow rectangular ring STL** (`0_Frame.stl`) that sits
+*under* the base plate:
+
+* `frame_enabled=True` (default) toggles the ring on/off.
+* `frame_width_mm` (default `2.0`) is the X/Y thickness of the ring.
+* `frame_depth_mm` (default `1.0`) is the Z thickness of the ring.
+* When enabled, the base plate and the entire colour stack are lifted by
+  `frame_depth_mm` so the frame, base, CMY layers and lithotop stack
+  perfectly with no Z-fighting.
+* The file is numbered `0_Frame.stl` so slicers load it first.
+
+Configure it from the Streamlit UI (**Structural frame** expander) or the
+CLI:
+
+```bash
+python lithophane_cmy.py photo.jpg --frame-width-mm 3 --frame-depth-mm 1.5
+python lithophane_cmy.py photo.jpg --no-frame          # disable the ring
+```
+
+Programmatically:
+
+```python
+result = process_image(
+    "photo.jpg",
+    frame_enabled=True,
+    frame_width_mm=3.0,
+    frame_depth_mm=1.5,
+)
+result.frame_stl     # numpy-stl Mesh, 24 triangles
+```
+
+---
+
+## Live 2.5D depth preview
+
+While you tweak the sliders in the Streamlit UI, VividVoxel renders an
+**instant grayscale depth-map preview** of the lithotop heightmap using
+only Pillow (no heavy STL pipeline).  Darker pixels = thicker columns =
+darker areas of the print.  Updates on every interaction so you always
+see the result before clicking **Generate lithophane**.
+
+You can call the same function programmatically:
+
+```python
+from lithophane_cmy import make_depth_preview
+preview = make_depth_preview(
+    "photo.jpg",
+    width_mm=100.0, height_mm=100.0,
+    lithotop_min_mm=0.8, lithotop_max_mm=5.0,
+    border_width_mm=2.0,
+)
+preview.save("preview.png")
+```
 
 ---
 
@@ -158,10 +335,14 @@ result = process_image(
     height_mm=100.0,               # physical height
     px_per_mm=10.0,                # CMY channel resolution
     mesh_px_per_mm=2.0,            # STL mesh resolution (lower = smaller file)
-    base_thickness_mm=0.6,         # flat base plate thickness
-    max_cmy_thickness_mm=0.5,      # CAP on per-layer CMY thickness
-    lithotop_min_mm=0.4,
-    lithotop_max_mm=2.4,
+    base_thickness_mm=0.6,         # (CLI only) flat base plate thickness
+    max_cmy_thickness_mm=0.4,      # (CLI only) CAP on per-layer CMY thickness
+    lithotop_min_mm=0.8,           # thinnest lithotop column
+    lithotop_max_mm=5.0,           # thickest lithotop column (auto-normalised)
+    border_width_mm=2.0,           # solid frame around every layer
+    frame_enabled=True,            # outer rectangular ring (0_Frame.stl)
+    frame_width_mm=2.0,            # X/Y thickness of the ring
+    frame_depth_mm=1.0,            # Z thickness of the ring
     preserve_aspect=True,
 )
 
@@ -172,14 +353,16 @@ C, M, Y = result.channels         # each: numpy.ndarray (H, W), float32 in [0, 1
 L       = result.luminance        # (H, W) float32 in [0, 1]
 z_top   = result.lithotop_z       # (H, W) float32 in mm
 
-result.base_stl                    # numpy-stl Mesh, 12 triangles
-result.cyan_layer_stl              # numpy-stl Mesh, heightmap on top of base
-result.magenta_layer_stl           # numpy-stl Mesh, heightmap on top of cyan
-result.yellow_layer_stl            # numpy-stl Mesh, heightmap on top of magenta
-result.lithotop_stl                # numpy-stl Mesh, heightmap on top of yellow
+result.frame_stl                  # optional: numpy-stl Mesh, 24 triangles
+result.base_stl                   # numpy-stl Mesh, 12 triangles
+result.cyan_layer_stl             # numpy-stl Mesh, heightmap on top of base
+result.magenta_layer_stl          # numpy-stl Mesh, heightmap on top of cyan
+result.yellow_layer_stl           # numpy-stl Mesh, heightmap on top of magenta
+result.lithotop_stl               # numpy-stl Mesh, heightmap on top of yellow
 
 save_preview(result, "output", base_name="my_lithophane")
-save_stls(result, "output")        # writes 1_Base_White.stl ... 5_Top_White.stl
+save_stls(result, "output")        # writes 0_Frame.stl ... 5_Top_White.stl
+# Or pass include_frame=False to skip the frame file
 ```
 
 `LithophaneResult` exposes:
@@ -189,14 +372,21 @@ save_stls(result, "output")        # writes 1_Base_White.stl ... 5_Top_White.stl
 * `result.rgb_normalized` — `(H, W, 3)` `float32` in `[0, 1]`
 * `result.luminance` — `(H, W)` `float32` in `[0, 1]`
 * `result.lithotop_z` — `(H, W)` `float32`, top-Z in **mm**
-* `result.base_stl`, `result.cyan_layer_stl`, `result.magenta_layer_stl`,
-  `result.yellow_layer_stl`, `result.lithotop_stl` — `numpy-stl` `Mesh` objects
+* `result.frame_stl`, `result.base_stl`, `result.cyan_layer_stl`,
+  `result.magenta_layer_stl`, `result.yellow_layer_stl`,
+  `result.lithotop_stl` — `numpy-stl` `Mesh` objects (frame may be
+  `None` if disabled)
 * `result.cmy_layers` — dict with the three CMY layer STLs
-* `result.verify_alignment()` — assert that all 5 STLs share X/Y origin
+* `result.verify_alignment()` — assert that all STLs share X/Y origin
 * `result.width_mm`, `result.height_mm`, `result.base_thickness_mm`,
   `result.max_cmy_thickness_mm`, `result.lithotop_min_mm`,
-  `result.lithotop_max_mm`, `result.px_per_mm`, `result.mesh_px_per_mm`
+  `result.lithotop_max_mm`, `result.px_per_mm`, `result.mesh_px_per_mm`,
+  `result.border_width_mm`, `result.frame_enabled`, `result.frame_width_mm`,
+  `result.frame_depth_mm`, `result.frame_bottom_z`, `result.frame_top_z`
 * `result.summary()` — human-readable multi-line summary
+* `make_depth_preview(source, width_mm, height_mm, lithotop_min_mm,
+  lithotop_max_mm, border_width_mm=2.0, px_per_mm=4.0)` — return a
+  `PIL.Image` of the grayscale depth-map (used by the live UI preview)
 
 ---
 
@@ -226,8 +416,7 @@ Default thickness 0.6 mm.
 
 For each ink colour we emit a single STL whose **bottom is flat** and
 whose **top is a heightmap** driven by the corresponding CMY channel.
-Per-pixel thickness is **capped at `max_cmy_thickness_mm`** (default
-**0.5 mm**):
+Per-pixel thickness is **capped at `max_cmy_thickness_mm`**:
 
 ```
 z_top[i, j] = z_layer_bottom + channel[i, j] * max_cmy_thickness_mm
@@ -276,14 +465,20 @@ usage: lithophane_cmy.py [-h] [--width WIDTH] [--height HEIGHT]
                          [--lithotop-min-mm LITHOTOP_MIN_MM]
                          [--lithotop-max-mm LITHOTOP_MAX_MM]
                          [--mesh-px-per-mm MESH_PX_PER_MM]
+                         [--border-width-mm BORDER_WIDTH_MM]
+                         [--frame-width-mm FRAME_WIDTH_MM]
+                         [--frame-depth-mm FRAME_DEPTH_MM]
+                         [--no-frame]
+                         [--simplify-faces SIMPLIFY_FACES] [--no-simplify]
                          [--demo]
                          [image]
 ```
 
 When `--base-name` is **not** given, the STLs are written with the
-slicer-friendly numbered names (`1_Base_White.stl`, `2_Cyan.stl`, ...).
-Pass `--base-name foo` to prepend a prefix (e.g. `foo_1_Base_White.stl`)
-so multiple lithophanes can coexist in one output directory.
+slicer-friendly numbered names (`0_Frame.stl`, `1_Base_White.stl`,
+`2_Cyan.stl`, ...).  Pass `--base-name foo` to prepend a prefix
+(e.g. `foo_1_Base_White.stl`) so multiple lithophanes can coexist in
+one output directory.  Pass `--no-frame` to skip `0_Frame.stl`.
 
 ---
 

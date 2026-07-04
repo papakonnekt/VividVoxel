@@ -1,4 +1,4 @@
-"""
+﻿"""
 lithophane_cmy.py
 =================
 
@@ -16,12 +16,12 @@ Print layout (Z grows upward, all dimensions in mm):
 
     z=2.0+    lithotop top  (varies with luminance)
     z=1.0+    lithotop bottom = base + max CMY stack height = 0.6 + 1.5
-              ┌─────────── Yellow layer  top = 1.0 + Y*0.5
-              │ bottom = 1.0 (flat)
-              ├─────────── Magenta layer top = 0.5 + M*0.5
-              │ bottom = 0.5 (flat)
-              ├─────────── Cyan layer    top = 0.0 + C*0.5
-              │ bottom = 0.0 (flat)
+              â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Yellow layer  top = 1.0 + Y*0.5
+              â”‚ bottom = 1.0 (flat)
+              â”œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Magenta layer top = 0.5 + M*0.5
+              â”‚ bottom = 0.5 (flat)
+              â”œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Cyan layer    top = 0.0 + C*0.5
+              â”‚ bottom = 0.0 (flat)
     z=0.0      Base plate (flat, 0.6 mm thick)
 
 CMY channel mapping (subtractive colour model):
@@ -118,6 +118,13 @@ except ImportError:                    # pragma: no cover
     _stl_mesh = None                   # type: ignore
     _HAS_NUMPY_STL = False
 
+try:
+    import trimesh as _trimesh         # type: ignore
+    _HAS_TRIMESH = True
+except ImportError:                    # pragma: no cover
+    _trimesh = None                    # type: ignore
+    _HAS_TRIMESH = False
+
 
 # ---------------------------------------------------------------------------
 # Configuration helpers
@@ -125,16 +132,29 @@ except ImportError:                    # pragma: no cover
 
 _RESAMPLE = Image.Resampling.LANCZOS
 
-# Base plate (the structural floor of the print).
+# Base plate (the structural floor of the print).  Hard-coded for standard
+# CMYK filament profiles; not exposed in the Streamlit UI.
 DEFAULT_BASE_THICKNESS_MM: float = 0.6
 
 # Each CMY color layer can be at most this thick (capped per the spec).
-DEFAULT_MAX_CMY_THICKNESS_MM: float = 0.5
+# Hard-coded for standard CMYK filament profiles; not exposed in the UI.
+DEFAULT_MAX_CMY_THICKNESS_MM: float = 0.4
 
 # Lithotop (top white layer) thickness range, added ON TOP of the
-# base plate + stacked CMY layers.
-DEFAULT_LITHOTOP_MIN_MM: float = 0.4
-DEFAULT_LITHOTOP_MAX_MM: float = 2.4
+# base plate + stacked CMY layers.  Exposed in the UI as
+# "Min Thickness" / "Max Thickness" with a 0.1 mm step.
+DEFAULT_LITHOTOP_MIN_MM: float = 0.8
+DEFAULT_LITHOTOP_MAX_MM: float = 5.0
+
+# Default border width (mm) added around the perimeter of every layer to
+# prevent light bleed.  Set to 0 to disable.
+DEFAULT_BORDER_WIDTH_MM: float = 2.0
+
+# Structural outer frame (a separate hollow rectangular ring STL).
+# These are exposed in the UI as "Frame Width" and "Frame Depth".
+DEFAULT_FRAME_WIDTH_MM: float = 2.0   # X/Y thickness of the frame ring
+DEFAULT_FRAME_DEPTH_MM: float = 1.0   # Z thickness of the frame ring
+DEFAULT_FRAME_ENABLED: bool = True
 
 # BT.601 luminance weights (R, G, B).
 _LUMA_WEIGHTS = np.array([0.299, 0.587, 0.114], dtype=np.float32)
@@ -232,6 +252,25 @@ def rgb_to_cmy_thickness(
     return C.astype(np.float32), M.astype(np.float32), Y.astype(np.float32)
 
 
+def _pad_with_ones(grid: np.ndarray, border_px: int) -> np.ndarray:
+    """Pad a grid with border_px rows/cols of 1.0 on every side.
+
+    Accepts both ``(H, W)`` 2-D arrays (single CMY channel / luminance)
+    and ``(H, W, C)`` 3-D arrays (RGB image).  Only the first two axes
+    are padded; channel axis (if present) is left untouched.
+    """
+    if border_px <= 0:
+        return grid
+    pad_width = [(border_px, border_px), (border_px, border_px)]
+    if grid.ndim == 3:
+        pad_width.append((0, 0))
+    return np.pad(
+        grid.astype(np.float32, copy=False),
+        pad_width,
+        mode="constant", constant_values=1.0,
+    )
+
+
 def rgb_to_luminance(img_rgb_float: np.ndarray) -> np.ndarray:
     """Compute BT.601 luminance for an H x W x 3 float image in [0, 1]."""
     if img_rgb_float.ndim != 3 or img_rgb_float.shape[2] != 3:
@@ -270,8 +309,8 @@ def make_base_plate_stl(
 ):
     """Build the flat rectangular base plate as a numpy-stl ``Mesh``.
 
-    Occupies ``x ∈ [0, width_mm]``, ``y ∈ [0, height_mm]``,
-    ``z ∈ [0, base_thickness_mm]``.  12 triangles (2 per face × 6 faces).
+    Occupies ``x âˆˆ [0, width_mm]``, ``y âˆˆ [0, height_mm]``,
+    ``z âˆˆ [0, base_thickness_mm]``.  12 triangles (2 per face Ã— 6 faces).
     """
     _require_stl()
     if width_mm <= 0 or height_mm <= 0 or base_thickness_mm <= 0:
@@ -510,6 +549,161 @@ def make_lithotop_stl(
     return _make_column_heightmap_stl(width_mm, height_mm, bottom, top)
 
 
+def make_frame_stl(
+    width_mm: float,
+    height_mm: float,
+    frame_width_mm: float = DEFAULT_FRAME_WIDTH_MM,
+    frame_depth_mm: float = DEFAULT_FRAME_DEPTH_MM,
+    bottom_z: float = 0.0,
+):
+    """Build a hollow rectangular **frame ring** STL.
+
+    The frame is a rectangular ring that wraps the outer perimeter of the
+    print.  The outer rectangle is ``width_mm x height_mm``; the inner
+    rectangle is ``(width_mm - 2*frame_width_mm) x (height_mm - 2*frame_width_mm)``.
+    The ring is solid in Z from ``bottom_z`` to ``bottom_z + frame_depth_mm``.
+
+    Returns ``None`` if ``frame_width_mm <= 0`` or ``frame_depth_mm <= 0``
+    or if the inner rectangle would be degenerate.  This is by design so
+    that the UI can simply pass ``0`` to disable the frame.
+
+    The frame shares the same X/Y origin as the lithotop and base plate
+    (it is anchored at x = 0, y = 0), so it stacks correctly in slicers.
+    """
+    _require_stl()
+    if frame_width_mm <= 0 or frame_depth_mm <= 0:
+        return None
+    if width_mm <= 0 or height_mm <= 0:
+        raise ValueError("width_mm and height_mm must be > 0")
+
+    outer_w = float(width_mm)
+    outer_h = float(height_mm)
+    inner_w = outer_w - 2.0 * float(frame_width_mm)
+    inner_h = outer_h - 2.0 * float(frame_width_mm)
+    if inner_w <= 0 or inner_h <= 0:
+        return None
+
+    z0 = float(bottom_z)
+    z1 = z0 + float(frame_depth_mm)
+    x0, x1 = 0.0, outer_w
+    y0, y1 = 0.0, outer_h
+    ix0, ix1 = float(frame_width_mm), float(frame_width_mm) + inner_w
+    iy0, iy1 = float(frame_width_mm), float(frame_width_mm) + inner_h
+
+    # ---- bottom rectangle (outer) ------------------------------------------
+    bot_outer = [
+        (x0, y0), (x1, y0), (x1, y1), (x0, y1)
+    ]
+    # ---- bottom rectangle (inner) ------------------------------------------
+    bot_inner = [
+        (ix0, iy0), (ix1, iy0), (ix1, iy1), (ix0, iy1)
+    ]
+
+    triangles = []  # list of (v0, v1, v2)
+
+    def tri(a, b, c):
+        triangles.append((a, b, c))
+
+    # Bottom face: outer CCW (-Z) plus inner CW (-Z) so the ring is solid.
+    tri((x0, y0, z0), (x1, y0, z0), (x1, y1, z0))
+    tri((x0, y0, z0), (x1, y1, z0), (x0, y1, z0))
+    tri((ix0, iy0, z0), (ix1, iy1, z0), (ix1, iy0, z0))
+    tri((ix0, iy0, z0), (ix0, iy1, z0), (ix1, iy1, z0))
+
+    # Top face: outer CCW (+Z) plus inner CW (+Z).
+    tri((x0, y0, z1), (x0, y1, z1), (x1, y1, z1))
+    tri((x0, y0, z1), (x1, y1, z1), (x1, y0, z1))
+    tri((ix0, iy0, z1), (ix1, iy0, z1), (ix1, iy1, z1))
+    tri((ix0, iy0, z1), (ix1, iy1, z1), (ix0, iy1, z1))
+
+    # Outer side walls (4 faces, each split into 2 tris).
+    # -Y wall: x in [x0, x1], y = y0
+    tri((x0, y0, z0), (x0, y0, z1), (x1, y0, z1))
+    tri((x0, y0, z0), (x1, y0, z1), (x1, y0, z0))
+    # +X wall: x = x1, y in [y0, y1]
+    tri((x1, y0, z0), (x1, y0, z1), (x1, y1, z1))
+    tri((x1, y0, z0), (x1, y1, z1), (x1, y1, z0))
+    # +Y wall: x in [x1, x0], y = y1
+    tri((x1, y1, z0), (x1, y1, z1), (x0, y1, z1))
+    tri((x1, y1, z0), (x0, y1, z1), (x0, y1, z0))
+    # -X wall: x = x0, y in [y1, y0]
+    tri((x0, y1, z0), (x0, y1, z1), (x0, y0, z1))
+    tri((x0, y1, z0), (x0, y0, z1), (x0, y0, z0))
+
+    # Inner side walls (4 faces) -- flipped winding so normals point inward.
+    # -Y inner wall: y = iy0
+    tri((ix0, iy0, z0), (ix1, iy0, z1), (ix0, iy0, z1))
+    tri((ix0, iy0, z0), (ix1, iy0, z0), (ix1, iy0, z1))
+    # +X inner wall: x = ix1
+    tri((ix1, iy0, z0), (ix1, iy0, z1), (ix1, iy1, z1))
+    tri((ix1, iy0, z0), (ix1, iy1, z1), (ix1, iy1, z0))
+    # +Y inner wall: y = iy1
+    tri((ix1, iy1, z0), (ix0, iy1, z1), (ix1, iy1, z1))
+    tri((ix1, iy1, z0), (ix0, iy1, z0), (ix0, iy1, z1))
+    # -X inner wall: x = ix0
+    tri((ix0, iy1, z0), (ix0, iy1, z1), (ix0, iy0, z1))
+    tri((ix0, iy1, z0), (ix0, iy0, z1), (ix0, iy0, z0))
+
+    tri_arr = np.array(triangles, dtype=np.float32)         # (N, 3, 3)
+    mesh_obj = _empty_stl_mesh(tri_arr.shape[0])
+    mesh_obj.vectors[:] = tri_arr
+    return mesh_obj
+
+
+def make_depth_preview(
+    source: Union[str, Path, Image.Image],
+    width_mm: float,
+    height_mm: float,
+    lithotop_min_mm: float,
+    lithotop_max_mm: float,
+    border_width_mm: float = DEFAULT_BORDER_WIDTH_MM,
+    px_per_mm: float = 4.0,
+) -> Image.Image:
+    """Render an instant 2.5D grayscale depth-map preview.
+
+    The preview maps the image's BT.601 luminance onto a grayscale
+    heightmap: white pixels (high luminance) become the thinnest
+    columns; black pixels (low luminance) become the thickest columns.
+    Border pixels are clamped to ``min`` so the border always prints
+    thin.  The returned image is a PIL ``L`` mode image of size
+    ``(width_mm * px_per_mm, height_mm * px_per_mm)``.
+
+    This is a lightweight Pillow-only path designed for the live
+    Streamlit preview; the heavy STL pipeline is run separately.
+    """
+    img = load_rgb_image(source)
+    target_w = max(1, int(round(width_mm * px_per_mm)))
+    target_h = max(1, int(round(height_mm * px_per_mm)))
+    if img.size != (target_w, target_h):
+        img = img.resize((target_w, target_h), resample=_RESAMPLE)
+
+    # BT.601 luminance
+    arr = np.asarray(img, dtype=np.float32) / 255.0      # H x W x 3
+    luma = arr @ _LUMA_WEIGHTS                            # H x W
+
+    # Pad with border (1.0 = thin = white in the preview)
+    border_px = max(0, int(round(border_width_mm * px_per_mm)))
+    if border_px > 0:
+        luma = np.pad(
+            luma,
+            ((border_px, border_px), (border_px, border_px)),
+            mode="constant", constant_values=1.0,
+        )
+
+    # Map [0,1] luminance -> [min,max] thickness, then invert for grayscale:
+    # darker pixel = thicker column = darker in the preview.
+    t_min = float(lithotop_min_mm)
+    t_max = float(lithotop_max_mm)
+    if t_max <= t_min:
+        t_max = t_min + 0.1
+    thickness = t_min + (1.0 - luma) * (t_max - t_min)
+    thickness = np.clip(thickness, t_min, t_max)
+    # Normalize to [0, 1] for display: max thickness -> 0 (black).
+    gray = 1.0 - (thickness - t_min) / (t_max - t_min)
+    gray_u8 = np.clip(gray * 255.0, 0, 255).astype(np.uint8)
+    return Image.fromarray(gray_u8, mode="L")
+
+
 # ---------------------------------------------------------------------------
 # Result container + high-level entry point
 # ---------------------------------------------------------------------------
@@ -536,11 +730,22 @@ class LithophaneResult:
     max_cmy_thickness_mm: float
     lithotop_min_mm: float
     lithotop_max_mm: float
+    border_width_mm: float = 0.0
+    effective_width_mm: float = 0.0
+    effective_height_mm: float = 0.0
+    # --- structural frame (optional) ---
+    frame_enabled: bool = False
+    frame_width_mm: float = DEFAULT_FRAME_WIDTH_MM
+    frame_depth_mm: float = DEFAULT_FRAME_DEPTH_MM
+    frame_bottom_z: float = 0.0
+    frame_top_z: float = 0.0
+    # --- STLs ---
     base_stl: Optional[object] = None    # numpy-stl Mesh or None
     cyan_layer_stl: Optional[object] = None
     magenta_layer_stl: Optional[object] = None
     yellow_layer_stl: Optional[object] = None
     lithotop_stl: Optional[object] = None
+    frame_stl: Optional[object] = None    # hollow rectangular ring or None
 
     @property
     def channels(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -592,7 +797,7 @@ class LithophaneResult:
             f"  Base plate          : {self.base_thickness_mm:.2f} mm",
             f"  Max CMY thickness   : {self.max_cmy_thickness_mm:.2f} mm "
             f"per color layer",
-            f"  Lithotop range      : {self.lithotop_min_mm:.2f} – "
+            f"  Lithotop range      : {self.lithotop_min_mm:.2f} â€“ "
             f"{self.lithotop_max_mm:.2f} mm (above base+CMY)",
             f"  Channel stats (min, mean, max):",
         ]
@@ -721,20 +926,30 @@ def process_image(
     height_mm: float = 100.0,
     px_per_mm: float = 10.0,
     preserve_aspect: bool = True,
-    # --- geometry parameters ---
+    # --- geometry parameters (base + per-channel CMY are hard-coded for
+    #     standard CMYK filament profiles and are NOT exposed in the UI;
+    #     the CLI still accepts them for power users) ---
     base_thickness_mm: float = DEFAULT_BASE_THICKNESS_MM,
     max_cmy_thickness_mm: float = DEFAULT_MAX_CMY_THICKNESS_MM,
     lithotop_min_mm: float = DEFAULT_LITHOTOP_MIN_MM,
     lithotop_max_mm: float = DEFAULT_LITHOTOP_MAX_MM,
+    border_width_mm: float = DEFAULT_BORDER_WIDTH_MM,
     mesh_px_per_mm: Optional[float] = None,
+    # --- structural outer frame ---
+    frame_enabled: bool = DEFAULT_FRAME_ENABLED,
+    frame_width_mm: float = DEFAULT_FRAME_WIDTH_MM,
+    frame_depth_mm: float = DEFAULT_FRAME_DEPTH_MM,
+    # --- output ---
     generate_stl: bool = True,
 ) -> LithophaneResult:
     """Run the full pipeline and return a :class:`LithophaneResult`.
 
     The returned result always contains the CMY thickness channels and the
     luminance field.  When ``generate_stl=True`` and ``numpy-stl`` is
-    installed, the result also contains five STL meshes:
+    installed, the result also contains up to six STL meshes:
 
+    * ``frame_stl``          -- (optional) hollow rectangular outer ring;
+                                ``None`` when ``frame_enabled=False``
     * ``base_stl``           -- the flat base plate
     * ``cyan_layer_stl``     -- cyan color layer (flat bottom, heightmap top)
     * ``magenta_layer_stl``  -- magenta color layer
@@ -742,8 +957,16 @@ def process_image(
     * ``lithotop_stl``       -- top white (luminance) layer
 
     The CMY color layers are stacked on top of the base plate, each capped
-    at ``max_cmy_thickness_mm`` (default **0.5 mm**).  The lithotop is
-    stacked on top of the CMY stack.
+    at ``max_cmy_thickness_mm`` (default **0.4 mm**).  The lithotop is
+    stacked on top of the CMY stack.  The luminance value of every pixel
+    is **automatically normalized** into the ``[lithotop_min_mm,
+    lithotop_max_mm]`` range, so adjusting the two end-points rescales
+    the whole 2.5D surface in a single click.
+
+    ``base_thickness_mm`` and ``max_cmy_thickness_mm`` are hard-coded
+    for standard CMYK filament profiles (0.6 mm and 0.4 mm) and are
+    not surfaced in the Streamlit UI; the CLI accepts overrides for
+    power users.
     """
     img = load_rgb_image(source)
     img_resized = resize_to_physical(
@@ -771,12 +994,23 @@ def process_image(
     mesh_C, mesh_M, mesh_Y = rgb_to_cmy_thickness(mesh_rgb_norm)
     mesh_luma = rgb_to_luminance(mesh_rgb_norm)
 
+    # ----- Border (Task 3) -----
+    border_px = max(0, int(round(
+        float(border_width_mm) * float(mesh_px_per_mm)
+    )))
+    effective_width_mm = float(width_mm) + 2.0 * float(border_width_mm)
+    effective_height_mm = float(height_mm) + 2.0 * float(border_width_mm)
+    mesh_C = _pad_with_ones(mesh_C, border_px)
+    mesh_M = _pad_with_ones(mesh_M, border_px)
+    mesh_Y = _pad_with_ones(mesh_Y, border_px)
+    mesh_luma_padded = _pad_with_ones(mesh_luma, border_px)
+
     # Lithotop z map (top-Z in mm): sits on top of base + CMY stack.
     z_above_base = (
         float(base_thickness_mm) + 3.0 * float(max_cmy_thickness_mm)
     )
     lithotop_z = z_above_base + float(lithotop_min_mm) + (
-        1.0 - mesh_luma
+        1.0 - mesh_luma_padded
     ) * float(lithotop_max_mm - lithotop_min_mm)
 
     base_stl = None
@@ -784,32 +1018,64 @@ def process_image(
     magenta_layer_stl = None
     yellow_layer_stl = None
     lithotop_stl = None
+    frame_stl = None
+
+    # Frame Z placement: the frame sits *under* the base plate so the
+    # border thickness belongs to the frame, not the base.  This way the
+    # border's depth is independent of the base plate thickness.
+    frame_bottom_z = 0.0
+    frame_top_z = float(frame_depth_mm) if frame_enabled else 0.0
 
     if generate_stl and _HAS_NUMPY_STL:
+        # Structural outer frame first (sits under the base plate).
+        if frame_enabled and frame_width_mm > 0 and frame_depth_mm > 0:
+            frame_stl = make_frame_stl(
+                width_mm=effective_width_mm,
+                height_mm=effective_height_mm,
+                frame_width_mm=float(frame_width_mm),
+                frame_depth_mm=float(frame_depth_mm),
+                bottom_z=frame_bottom_z,
+            )
         base_stl = make_base_plate_stl(
-            width_mm, height_mm, base_thickness_mm
+            effective_width_mm,
+            effective_height_mm,
+            base_thickness_mm,
         )
+        # Lift the base on top of the frame when the frame is enabled.
+        base_bottom_z = float(frame_top_z) if frame_enabled else 0.0
+        if frame_enabled and base_bottom_z > 0.0:
+            base_stl.vectors[:, :, 2] += base_bottom_z
+        # The CMY stack sits on top of the (possibly lifted) base.
+        cmy_stack_bottom_z = base_bottom_z + float(base_thickness_mm)
         cmy_layers = make_cmy_layers_stls(
-            width_mm=width_mm,
-            height_mm=height_mm,
+            width_mm=effective_width_mm,
+            height_mm=effective_height_mm,
             cyan=mesh_C,
             magenta=mesh_M,
             yellow=mesh_Y,
             max_thickness_mm=max_cmy_thickness_mm,
-            base_bottom_z=float(base_thickness_mm),
+            base_bottom_z=cmy_stack_bottom_z,
         )
         cyan_layer_stl = cmy_layers["cyan"]
         magenta_layer_stl = cmy_layers["magenta"]
         yellow_layer_stl = cmy_layers["yellow"]
+        # The lithotop sits on top of the (possibly lifted) CMY stack.
+        lithotop_z_stl = cmy_stack_bottom_z + 3.0 * float(max_cmy_thickness_mm)
         lithotop_stl = make_lithotop_stl(
-            width_mm=width_mm,
-            height_mm=height_mm,
+            width_mm=effective_width_mm,
+            height_mm=effective_height_mm,
             base_thickness_mm=base_thickness_mm,
-            rgb_normalized=mesh_rgb_norm,
+            rgb_normalized=_pad_with_ones(mesh_rgb_norm, border_px),
             lithotop_min_mm=lithotop_min_mm,
             lithotop_max_mm=lithotop_max_mm,
-            lithotop_bottom_z=z_above_base,
+            lithotop_bottom_z=lithotop_z_stl,
         )
+        # The Numpy lithotop_z map needs the same baseline so that
+        # the preview matches the STL geometry.
+        z_above_base = lithotop_z_stl
+        lithotop_z = lithotop_z_stl + float(lithotop_min_mm) + (
+            1.0 - mesh_luma_padded
+        ) * float(lithotop_max_mm - lithotop_min_mm)
 
     return LithophaneResult(
         rgb_normalized=rgb_norm,
@@ -820,8 +1086,8 @@ def process_image(
         lithotop_z=lithotop_z.astype(np.float32),
         width_px=img_resized.size[0],
         height_px=img_resized.size[1],
-        mesh_width_px=mesh_width_px,
-        mesh_height_px=mesh_height_px,
+        mesh_width_px=mesh_C.shape[1],
+        mesh_height_px=mesh_C.shape[0],
         width_mm=width_mm,
         height_mm=height_mm,
         px_per_mm=px_per_mm,
@@ -830,11 +1096,20 @@ def process_image(
         max_cmy_thickness_mm=max_cmy_thickness_mm,
         lithotop_min_mm=lithotop_min_mm,
         lithotop_max_mm=lithotop_max_mm,
+        border_width_mm=float(border_width_mm),
+        effective_width_mm=effective_width_mm,
+        effective_height_mm=effective_height_mm,
+        frame_enabled=bool(frame_enabled),
+        frame_width_mm=float(frame_width_mm),
+        frame_depth_mm=float(frame_depth_mm),
+        frame_bottom_z=float(frame_bottom_z),
+        frame_top_z=float(frame_top_z),
         base_stl=base_stl,
         cyan_layer_stl=cyan_layer_stl,
         magenta_layer_stl=magenta_layer_stl,
         yellow_layer_stl=yellow_layer_stl,
         lithotop_stl=lithotop_stl,
+        frame_stl=frame_stl,
     )
 
 
@@ -897,8 +1172,11 @@ def save_preview(
     return paths
 
 
-#: Slicer-friendly STL file names, in load order (1 -> 5).
+#: Slicer-friendly STL file names, in load order.  The optional ``"frame"``
+#: mesh is numbered ``0`` so most slicers load it FIRST and use it as
+#: the structural bottom of the print.
 STL_FILE_NAMES: Dict[str, str] = {
+    "frame":    "0_Frame.stl",
     "base":     "1_Base_White.stl",
     "cyan":     "2_Cyan.stl",
     "magenta":  "3_Magenta.stl",
@@ -911,6 +1189,7 @@ def save_stls(
     result: LithophaneResult,
     output_dir: Union[str, Path],
     base_name: Optional[str] = None,
+    include_frame: Optional[bool] = None,
 ) -> Dict[str, Path]:
     """Save the base, CMY color layer and lithotop STLs.
 
@@ -951,13 +1230,20 @@ def save_stls(
     Dict mapping ``"base" | "cyan" | "magenta" | "yellow" | "lithotop"``
     to the file path written for each mesh.
     """
-    meshes = {
+    meshes: Dict[str, object] = {
         "base": result.base_stl,
         "cyan": result.cyan_layer_stl,
         "magenta": result.magenta_layer_stl,
         "yellow": result.yellow_layer_stl,
         "lithotop": result.lithotop_stl,
     }
+    # Frame is OPTIONAL: only include it if it was actually generated.
+    if include_frame is None:
+        include_frame = getattr(result, "frame_stl", None) is not None
+    if include_frame and getattr(result, "frame_stl", None) is not None:
+        meshes["frame"] = result.frame_stl
+
+    # Only complain about missing meshes for the ones we are actually writing.
     missing = [k for k, v in meshes.items() if v is None]
     if missing:
         raise RuntimeError(
@@ -969,14 +1255,126 @@ def save_stls(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     paths: Dict[str, Path] = {}
-    for name, mesh_obj in meshes.items():
+    # Write files in the canonical numeric order so slicers always see
+    # them in 0 -> 5 order regardless of dict insertion order.
+    ordered_keys = sorted(
+        meshes.keys(),
+        key=lambda k: STL_FILE_NAMES[k],
+    )
+    for name in ordered_keys:
+        mesh_obj = meshes[name]
         filename = STL_FILE_NAMES[name]
         if base_name:
             filename = f"{base_name}_{filename}"
         path = output_dir / filename
-        mesh_obj.save(str(path))
+        save_binary_stl(mesh_obj, path)
         paths[name] = path
     return paths
+
+
+def _numpy_stl_to_trimesh(stl_mesh):
+    """Convert a numpy-stl Mesh to a trimesh.Trimesh."""
+    vertices = stl_mesh.vectors.reshape(-1, 3)
+    unique, inverse = np.unique(vertices, axis=0, return_inverse=True)
+    faces = inverse.reshape(-1, 3).astype(np.int64)
+    return _trimesh.Trimesh(vertices=unique, faces=faces, process=False)
+
+
+def _trimesh_to_numpy_stl(tri, dtype):
+    """Convert a trimesh.Trimesh back into a numpy-stl Mesh array."""
+    n = len(tri.faces)
+    out = np.zeros(n, dtype=dtype)
+    out["vectors"][:, 0] = tri.vertices[tri.faces[:, 0]]
+    out["vectors"][:, 1] = tri.vertices[tri.faces[:, 1]]
+    out["vectors"][:, 2] = tri.vertices[tri.faces[:, 2]]
+    return out
+
+
+def simplify_meshes(
+    meshes,
+    target_face_count=None,
+    merge_tolerance=1e-5,
+):
+    """Simplify every numpy-stl Mesh in *meshes* using trimesh.
+
+    Stage 1: merge_vertices (removes duplicates shared between
+             adjacent pixel columns -- huge triangle-count win).
+    Stage 2 (optional): quadric-error-mesh decimation to
+             *target_face_count* triangles.
+
+    Returns a new dict ``name -> numpy-stl.Mesh`` and stashes before /
+    after counts in ``simplify_meshes._stats``.
+    """
+    _require_stl()
+    if not _HAS_TRIMESH:
+        raise RuntimeError(
+            "trimesh is required for mesh simplification but is not "
+            "installed.  Install it with:  pip install trimesh"
+        )
+    out = {}
+    for name, stl_mesh in meshes.items():
+        if stl_mesh is None:
+            out[name] = None
+            continue
+        tri = _numpy_stl_to_trimesh(stl_mesh)
+        # Stage 1: merge coincident vertices.  trimesh 4.x has multiple
+        # ways to do this; we use merge_vertices() with no args (which
+        # merges by default tolerance) plus process() to deduplicate
+        # and clean up.  We wrap process() in a try/except because some
+        # trimesh builds require scipy._propack (DLL not always present).
+        try:
+            tri.merge_vertices()
+        except TypeError:
+            # Older trimesh accepts a `digits` kwarg
+            tri.merge_vertices(digits=int(-np.log10(merge_tolerance)))
+        try:
+            tri.process(validate=False)
+        except Exception:
+            # process() can fail on missing scipy/numpy-stl-bundled
+            # native libs; the mesh is still valid for simplification.
+            pass
+        before = len(tri.faces)
+        if (
+            target_face_count is not None
+            and target_face_count > 0
+            and target_face_count < before
+        ):
+            try:
+                tri = tri.simplify_quadric_decimation(
+                    face_count=int(target_face_count)
+                )
+            except Exception as e:
+                print(
+                    f"simplify_meshes: QEM failed for {name!r} ({e}); "
+                    "skipping decimation for this mesh.",
+                    flush=True,
+                )
+        after = len(tri.faces)
+        arr = _trimesh_to_numpy_stl(tri, _stl_mesh.Mesh.dtype)
+        out[name] = _stl_mesh.Mesh(arr)
+        if not hasattr(simplify_meshes, "_stats"):
+            simplify_meshes._stats = {}
+        simplify_meshes._stats[name] = (before, after)
+    return out
+
+
+def save_binary_stl(stl_mesh, path):
+    """Save a numpy-stl Mesh as a **binary** STL (about half the size
+    of ASCII).  Falls back to ASCII on older numpy-stl.
+    """
+    from pathlib import Path as _P
+    p = _P(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from stl import Mode as _Mode
+        stl_mesh.save(str(p), mode=_Mode.BINARY)
+    except (ImportError, TypeError):
+        # Older numpy-stl without Mode enum or without mode kwarg
+        try:
+            stl_mesh.save(str(p), mode=2)  # 2 = BINARY in older versions
+        except TypeError:
+            stl_mesh.save(str(p))
+    return p
 
 
 def make_demo_image(size: Tuple[int, int] = (640, 480)) -> Image.Image:
@@ -1036,6 +1434,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--mesh-px-per-mm", type=float, default=None,
                    help="STL mesh resolution in px/mm (default: same as "
                         "--px-per-mm).  Set lower to keep STL files small.")
+    p.add_argument("--border-width-mm", type=float,
+                   default=DEFAULT_BORDER_WIDTH_MM,
+                   help=f"Solid frame around the perimeter, mm "
+                        f"(default: {DEFAULT_BORDER_WIDTH_MM}, 0 = off).")
+    p.add_argument("--frame-width-mm", type=float,
+                   default=DEFAULT_FRAME_WIDTH_MM,
+                   help=f"Structural outer ring X/Y thickness in mm "
+                        f"(default: {DEFAULT_FRAME_WIDTH_MM}, 0 = off).")
+    p.add_argument("--frame-depth-mm", type=float,
+                   default=DEFAULT_FRAME_DEPTH_MM,
+                   help=f"Structural outer ring Z thickness in mm "
+                        f"(default: {DEFAULT_FRAME_DEPTH_MM}, 0 = off).")
+    p.add_argument("--no-frame", action="store_true",
+                   help="Disable the structural frame ring (0_Frame.stl).")
+    p.add_argument("--simplify-faces", type=int, default=None,
+                   help="Optional: target face count after trimesh QEM "
+                        "decimation (e.g. 50000).  Default: no decimation.")
+    p.add_argument("--no-simplify", action="store_true",
+                   help="Skip the trimesh merge_vertices pass too.")
     p.add_argument("--demo", action="store_true")
     return p
 
@@ -1066,6 +1483,10 @@ def main(argv: Optional[list] = None) -> int:
         max_cmy_thickness_mm=args.max_cmy_thickness_mm,
         lithotop_min_mm=args.lithotop_min_mm,
         lithotop_max_mm=args.lithotop_max_mm,
+        border_width_mm=args.border_width_mm,
+        frame_enabled=not args.no_frame,
+        frame_width_mm=args.frame_width_mm,
+        frame_depth_mm=args.frame_depth_mm,
         mesh_px_per_mm=args.mesh_px_per_mm,
         generate_stl=not args.no_stl,
     )
@@ -1099,11 +1520,34 @@ def main(argv: Optional[list] = None) -> int:
                 print(f"  {name:8s}  x=[{x0:.3f}, {x1:.3f}]  "
                       f"y=[{y0:.3f}, {y1:.3f}]", flush=True)
 
-            # Use exactly the slicer-friendly numbered filenames when no
-            # explicit --base-name is given.  Pass args.base_name (which is
-            # None unless the user passed --base-name) so the STLs are
-            # written as "1_Base_White.stl", "2_Cyan.stl", ... with no
-            # extra prefix.
+            # Optional mesh simplification via trimesh (Task 2).
+            # Skip when --no-simplify is set or trimesh is unavailable.
+            if not args.no_simplify and _HAS_TRIMESH:
+                pre = {
+                    "base":     result.base_stl,
+                    "cyan":     result.cyan_layer_stl,
+                    "magenta":  result.magenta_layer_stl,
+                    "yellow":   result.yellow_layer_stl,
+                    "lithotop": result.lithotop_stl,
+                }
+                if result.frame_stl is not None:
+                    pre["frame"] = result.frame_stl
+                print("\nSimplifying meshes with trimesh ...", flush=True)
+                simplified = simplify_meshes(
+                    pre, target_face_count=args.simplify_faces
+                )
+                result.base_stl = simplified["base"]
+                result.cyan_layer_stl = simplified["cyan"]
+                result.magenta_layer_stl = simplified["magenta"]
+                result.yellow_layer_stl = simplified["yellow"]
+                result.lithotop_stl = simplified["lithotop"]
+                if "frame" in simplified:
+                    result.frame_stl = simplified["frame"]
+                if hasattr(simplify_meshes, "_stats"):
+                    for name, (b, a) in simplify_meshes._stats.items():
+                        pct = 100.0 * a / max(b, 1)
+                        print(f"    {name:8s}: {b:>9,} -> {a:>9,} "
+                              f"triangles  ({pct:5.1f}%)", flush=True)
             stl_paths = save_stls(
                 result, output_dir=args.out_dir, base_name=args.base_name
             )
